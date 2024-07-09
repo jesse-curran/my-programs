@@ -1,7 +1,10 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
 from openai import OpenAI
+import chromadb
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 app = Flask(__name__)
 CORS(app)
@@ -10,8 +13,16 @@ CORS(app)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///golf_caddy.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
+migrate = Migrate(app, db)
 
 client = OpenAI(api_key='sk-proj-1Zatllzfe1VSwU0JGSKbT3BlbkFJ9KofsMF67lK3bHqn8vj0')
+
+# Initialize ChromaDB client
+chroma_client = chromadb.Client()
+
+# Create or get a collection
+collection_name = 'golf_caddy_vectors'
+collection = chroma_client.get_or_create_collection(name=collection_name)
 
 # Database models
 class PreRoundInfo(db.Model):
@@ -22,9 +33,12 @@ class PreRoundInfo(db.Model):
     driver_distance = db.Column(db.Integer, nullable=False)
     iron_7_distance = db.Column(db.Integer, nullable=False)
     characteristics = db.Column(db.String(200), nullable=False)
+    vector_representation = db.Column(db.PickleType, nullable=True)  # Store the vector representation
 
 with app.app_context():
     db.create_all()
+
+vectorizer = TfidfVectorizer()
 
 @app.route('/')
 def home():
@@ -49,8 +63,19 @@ def save_pre_round_info():
         characteristics=characteristics
     )
 
+    # Create vector representation
+    description = f"{player_name} {handicap} {driver_distance} {iron_7_distance} {characteristics}"
+    vector_representation = vectorizer.fit_transform([description]).toarray()[0]
+    pre_round_info.vector_representation = vector_representation
+
     db.session.add(pre_round_info)
     db.session.commit()
+
+    # Save vector to ChromaDB
+    collection.upsert(
+        documents=[description],
+        ids=[user_id]
+    )
 
     return jsonify({"message": "Pre-round info saved successfully"}), 201
 
@@ -92,7 +117,7 @@ def chat():
             "characteristics": user_info.characteristics
         }
 
-        
+        # Prepare the prompt for GPT-3.5-turbo
         messages = [
             {"role": "system", "content": "You are a helpful golf caddy."},
             {"role": "user", "content": f"Player Info: {user_info_dict}"},
